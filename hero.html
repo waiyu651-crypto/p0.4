@@ -1,0 +1,680 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; }
+  #hero {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+    height: 100%;
+    background: radial-gradient(120% 160% at 15% 20%, #14151a 0%, #0b0c0f 60%, #0b0c0f 100%);
+    border-radius: 14px;
+    box-sizing: border-box;
+    position: relative;
+  }
+  #textWrap {
+    position: relative;
+    flex: 1 1 55%;
+    height: 100%;
+    min-width: 260px;
+  }
+  #textCanvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  #tagline {
+    position: absolute;
+    left: 6%;
+    bottom: 14%;
+    color: #9aa0ac;
+    font: 500 14px system-ui, -apple-system, sans-serif;
+    letter-spacing: .03em;
+    opacity: 0;
+    transition: opacity 900ms ease 900ms;
+  }
+  #tagline.show { opacity: 1; }
+  #globeWrap { position: relative; flex: 1 1 45%; height: 100%; min-width: 200px; }
+</style>
+</head>
+<body>
+<div id="hero">
+  <div id="textWrap">
+    <canvas id="textCanvas"></canvas>
+    <div id="tagline">GSO / GCTS lookup, model extraction &amp; report tools</div>
+  </div>
+  <div id="globeWrap"></div>
+</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js" } }
+</script>
+
+<script type="module">
+import * as THREE from "three";
+
+/* ============================================================
+   PARTICLE TEXT  (ported from the Pixel Drift Originkit component)
+   ============================================================ */
+function cubicBezier(x1, y1, x2, y2) {
+  const cx = 3 * x1, bx = 3 * (x2 - x1) - cx, ax = 1 - cx - bx;
+  const cy = 3 * y1, by = 3 * (y2 - y1) - cy, ay = 1 - cy - by;
+  const sampleX = t => ((ax * t + bx) * t + cx) * t;
+  const sampleY = t => ((ay * t + by) * t + cy) * t;
+  return x => {
+    if (x <= 0) return 0;
+    if (x >= 1) return 1;
+    let lo = 0, hi = 1, t = x;
+    for (let i = 0; i < 12; i++) {
+      const mid = (lo + hi) / 2, sx = sampleX(mid);
+      if (Math.abs(sx - x) < 1e-6) { t = mid; break; }
+      if (sx < x) lo = mid; else hi = mid;
+      t = mid;
+    }
+    return sampleY(t);
+  };
+}
+
+function runParticleText({
+  canvas, text, colors, particleSize = 10, particleCount = 46,
+  fontSize = 64, mouseForce = 9, durationMs = 1300,
+  ease = [0.44, 0, 0.56, 1],
+}) {
+  const ctx = canvas.getContext("2d", { alpha: true });
+  const easeFn = cubicBezier(...ease);
+  const palette = colors && colors.length ? colors : ["#F9731A"];
+
+  let cssW = 0, cssH = 0, dpr = 1;
+  let count = 0;
+  let ox = new Float32Array(0), oy = new Float32Array(0);
+  let sx = new Float32Array(0), sy = new Float32Array(0);
+  let px = new Float32Array(0), py = new Float32Array(0);
+  let repX = new Float32Array(0), repY = new Float32Array(0);
+  let cIdx = new Uint8Array(0);
+
+  const mouse = { x: -99999, y: -99999, active: false, speed: 0, prevX: -99999, prevY: -99999, smoothX: -99999, smoothY: -99999 };
+  let formVal = 0, lastFrame = null, started = false;
+
+  function sampleText() {
+    const W = cssW, H = cssH;
+    if (W <= 0 || H <= 0) return;
+    const off = document.createElement("canvas");
+    off.width = Math.max(1, Math.floor(W * dpr));
+    off.height = Math.max(1, Math.floor(H * dpr));
+    const offCtx = off.getContext("2d", { willReadFrequently: true });
+    offCtx.scale(dpr, dpr);
+    const family = 'system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif';
+
+    let effSize = fontSize;
+    offCtx.font = `800 ${effSize}px ${family}`;
+    const gm = offCtx.measureText(text);
+    const gW = gm.width || 1;
+    const gH = (gm.actualBoundingBoxAscent || effSize * 0.8) + (gm.actualBoundingBoxDescent || effSize * 0.2);
+    const maxW = W * 0.9, maxH = H * 0.7;
+    const fit = Math.min(1, maxW / gW, maxH / gH);
+    if (fit < 1) effSize = Math.max(10, effSize * fit);
+
+    offCtx.clearRect(0, 0, W, H);
+    offCtx.fillStyle = "#fff";
+    offCtx.font = `800 ${effSize}px ${family}`;
+    offCtx.textAlign = "left";
+    offCtx.textBaseline = "middle";
+    offCtx.fillText(text, W * 0.06, H * 0.42);
+
+    const img = offCtx.getImageData(0, 0, Math.floor(W * dpr), Math.floor(H * dpr));
+    const data = img.data;
+    const stride = Math.max(2, Math.round(150 / Math.max(1, Math.min(50, particleCount))));
+
+    let candidates = 0;
+    for (let y = 0; y < H; y += stride) for (let x = 0; x < W; x += stride) {
+      const idx = (Math.floor(y * dpr) * img.width + Math.floor(x * dpr)) * 4 + 3;
+      if (data[idx] > 128) candidates++;
+    }
+    const downsample = candidates > 12000 ? Math.ceil(candidates / 12000) : 1;
+    const alloc = Math.min(candidates, 12000);
+    const nOx = new Float32Array(alloc), nOy = new Float32Array(alloc);
+    const nSx = new Float32Array(alloc), nSy = new Float32Array(alloc);
+    const nPx = new Float32Array(alloc), nPy = new Float32Array(alloc);
+    const nC = new Uint8Array(alloc);
+
+    let i = 0, seen = 0;
+    for (let y = 0; y < H && i < alloc; y += stride) for (let x = 0; x < W && i < alloc; x += stride) {
+      const idx = (Math.floor(y * dpr) * img.width + Math.floor(x * dpr)) * 4 + 3;
+      if (data[idx] > 128) {
+        if (seen % downsample === 0) {
+          const ang = Math.random() * Math.PI * 2;
+          const rad = Math.max(W, H) * (0.6 + Math.random() * 0.5);
+          nOx[i] = x; nOy[i] = y;
+          nSx[i] = W / 2 + Math.cos(ang) * rad;
+          nSy[i] = H / 2 + Math.sin(ang) * rad;
+          nPx[i] = nSx[i]; nPy[i] = nSy[i];
+          nC[i] = Math.floor(Math.random() * palette.length);
+          i++;
+        }
+        seen++;
+      }
+    }
+    count = i; ox = nOx; oy = nOy; sx = nSx; sy = nSy; px = nPx; py = nPy;
+    repX = new Float32Array(alloc); repY = new Float32Array(alloc); cIdx = nC;
+    formVal = 0; lastFrame = null;
+  }
+
+  function resize() {
+    const r = canvas.parentElement.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return;
+    dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    cssW = r.width; cssH = r.height;
+    canvas.width = Math.floor(cssW * dpr);
+    canvas.height = Math.floor(cssH * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    sampleText();
+  }
+  new ResizeObserver(resize).observe(canvas.parentElement);
+  resize();
+
+  canvas.addEventListener("pointermove", e => {
+    const r = canvas.getBoundingClientRect();
+    const mx = e.clientX - r.left, my = e.clientY - r.top;
+    if (mouse.prevX > -9000) {
+      const dx = mx - mouse.prevX, dy = my - mouse.prevY;
+      mouse.speed = Math.sqrt(dx * dx + dy * dy);
+    }
+    mouse.prevX = mx; mouse.prevY = my; mouse.x = mx; mouse.y = my; mouse.active = true;
+  });
+  canvas.addEventListener("pointerleave", () => { mouse.active = false; mouse.prevX = -99999; mouse.prevY = -99999; });
+
+  const buckets = palette.map(() => []);
+  const radiusCutoff = 90, radiusSq = radiusCutoff * radiusCutoff;
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+    ctx.clearRect(0, 0, cssW, cssH);
+    if (!started) return;
+    const last = lastFrame ?? now;
+    const dt = Math.min(64, Math.max(0, now - last));
+    lastFrame = now;
+    if (formVal < 1) formVal = Math.min(1, formVal + dt / durationMs);
+    const factor = easeFn(formVal);
+    const forming = formVal < 1;
+    const drawSize = Math.max(1, particleSize / 4), half = drawSize / 2;
+
+    mouse.speed *= 0.88;
+    const active = !forming && mouse.active;
+    if (active) {
+      const lerp = Math.max(0.08, 0.3 - mouse.speed * 0.006);
+      if (mouse.smoothX < -9000) { mouse.smoothX = mouse.x; mouse.smoothY = mouse.y; }
+      else { mouse.smoothX += (mouse.x - mouse.smoothX) * lerp; mouse.smoothY += (mouse.y - mouse.smoothY) * lerp; }
+    } else { mouse.smoothX = -99999; mouse.smoothY = -99999; }
+
+    for (const b of buckets) b.length = 0;
+    for (let i = 0; i < count; i++) {
+      if (forming) {
+        px[i] = sx[i] + (ox[i] - sx[i]) * factor;
+        py[i] = sy[i] + (oy[i] - sy[i]) * factor;
+        buckets[cIdx[i]].push(i);
+        continue;
+      }
+      let inZone = false;
+      if (active) {
+        const dx = ox[i] - mouse.smoothX, dy = oy[i] - mouse.smoothY;
+        const d2 = dx * dx + dy * dy;
+        if (d2 > 0 && d2 < radiusSq) {
+          const dist = Math.sqrt(d2), nx = dx / dist, ny = dy / dist;
+          const falloff = 1 - dist / radiusCutoff;
+          const push = falloff * mouse.speed * mouseForce * 0.05;
+          repX[i] += nx * push; repY[i] += ny * push;
+          const tX = nx * (radiusCutoff - dist), tY = ny * (radiusCutoff - dist);
+          repX[i] += (tX - repX[i]) * 0.06; repY[i] += (tY - repY[i]) * 0.06;
+          inZone = true;
+        }
+      }
+      if (!inZone) { repX[i] *= 0.97; repY[i] *= 0.97; }
+      px[i] = ox[i] + repX[i]; py[i] = oy[i] + repY[i];
+      buckets[cIdx[i]].push(i);
+    }
+
+    ctx.globalAlpha = forming ? Math.max(0, Math.min(1, factor)) : 1;
+    for (let b = 0; b < buckets.length; b++) {
+      const bucket = buckets[b];
+      if (!bucket.length) continue;
+      ctx.fillStyle = palette[b];
+      for (const i of bucket) ctx.fillRect(px[i] - half, py[i] - half, drawSize, drawSize);
+    }
+    ctx.globalAlpha = 1;
+  }
+  requestAnimationFrame(frame);
+  requestAnimationFrame(() => { started = true; });
+}
+
+/* ============================================================
+   GLOBE  (ported from the Globe Mesh Originkit component)
+   ============================================================ */
+const PERSPECTIVE = 0.15, SOURCES = 3, CAGE = 1.18, DRAG = 0.021;
+const GDEFAULTS = {
+  dot: "#FFFFFF", net: "#FF0040", density: 20, spin: 20, spinDir: "right",
+  hoverOn: true, sizePercent: 53,
+  dots: { size: 8, wobble: 6, flicker: 7 },
+  cage: { detail: 1, spread: 8, glow: 11 },
+  shimmer: { color: "#D8CCFF", speed: 9, style: "sweep", angle: 90, width: 7 },
+  waves: { color: "#6FA8FF", color2: "#FF5E8F", size: 9, glow: 11, speed: 7 },
+  hover: { fill: 9, glow: 11, reach: 9 },
+};
+function clamp(v, lo, hi, fb) { const n = typeof v === "number" && isFinite(v) ? v : fb; return Math.max(lo, Math.min(hi, n)); }
+function settingsFor(cfg) {
+  const d = cfg.dots, cg = cfg.cage, sh = cfg.shimmer, wv = cfg.waves, hv = cfg.hover;
+  const on = cfg.hoverOn === false ? 0 : 1;
+  const density = clamp(cfg.density, 1, 20, GDEFAULTS.density);
+  const cageSpread = clamp(cg.spread, 1, 20, GDEFAULTS.cage.spread);
+  return {
+    points: Math.round(300 + density * density * 22),
+    dotSize: 0.004 + clamp(d.size, 1, 20, 8) * 0.0013,
+    wobble: clamp(d.wobble, 0, 20, 6) * 0.0055,
+    flicker: clamp(d.flicker, 0, 20, 7) * 0.042,
+    detail: Math.round(clamp(cg.detail, 0, 4, 1)),
+    cage: CAGE + (cageSpread - 8) * 0.022,
+    netGlow: clamp(cg.glow, 0, 20, 11) * 0.075,
+    shimmer: clamp(sh.speed, 0, 20, 9) * 0.03,
+    edgeMix: sh.style === "sweep" ? 0 : 1,
+    sweepMix: sh.style === "sweep" ? 1 : 0,
+    sweepAxis: clamp(sh.angle, 0, 360, 90) * (Math.PI / 180),
+    sweepWidth: 0.05 + clamp(sh.width, 1, 20, 7) * 0.022,
+    spread: 0.12 + clamp(wv.size, 1, 20, 9) * 0.045,
+    intensity: clamp(wv.glow, 0, 20, 11) * 0.075,
+    wave: clamp(wv.speed, 0, 20, 7) * 0.11,
+    hoverFill: on * clamp(hv.fill, 0, 20, 9) * 0.007,
+    hoverGlow: on * clamp(hv.glow, 0, 20, 11) * 0.09,
+    hoverArc: 0.25 + clamp(hv.reach, 1, 20, 9) * 0.055,
+    hoverOn: on,
+    spin: clamp(cfg.spin, 0, 20, 20) * 0.055 * (cfg.spinDir === "left" ? -1 : 1),
+    radius: 1,
+  };
+}
+function buildPoints(count) {
+  const dirs = new Float32Array(count * 3), seeds = new Float32Array(count);
+  const golden = Math.PI * (3 - Math.sqrt(5));
+  for (let i = 0; i < count; i++) {
+    const y = 1 - (i / Math.max(1, count - 1)) * 2;
+    const r = Math.sqrt(Math.max(0, 1 - y * y));
+    const a = golden * i;
+    dirs[i * 3] = Math.cos(a) * r; dirs[i * 3 + 1] = y; dirs[i * 3 + 2] = Math.sin(a) * r;
+    seeds[i] = Math.abs(Math.sin(i * 127.1 + 311.7) * 43758.5453) % 1;
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(dirs, 3));
+  g.setAttribute("aDir", new THREE.BufferAttribute(dirs, 3));
+  g.setAttribute("aSeed", new THREE.BufferAttribute(seeds, 1));
+  g.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 2);
+  return g;
+}
+function buildCage(radius, detail) {
+  const solid = new THREE.IcosahedronGeometry(radius, detail);
+  const edges = new THREE.EdgesGeometry(solid);
+  const pos = edges.attributes.position, n = pos.count;
+  const param = new Float32Array(n), edgeSeed = new Float32Array(n);
+  for (let i = 0; i < n; i += 2) {
+    param[i] = 0; param[i + 1] = 1;
+    const mx = (pos.getX(i) + pos.getX(i + 1)) * 0.5, my = (pos.getY(i) + pos.getY(i + 1)) * 0.5, mz = (pos.getZ(i) + pos.getZ(i + 1)) * 0.5;
+    const s = Math.abs(Math.sin(mx * 127.1 + my * 311.7 + mz * 74.7) * 43758.5453) % 1;
+    edgeSeed[i] = s; edgeSeed[i + 1] = s;
+  }
+  edges.setAttribute("aEdge", new THREE.BufferAttribute(param, 1));
+  edges.setAttribute("aSeed", new THREE.BufferAttribute(edgeSeed, 1));
+  const fp = solid.attributes.position, verts = fp.count;
+  const face = new Float32Array(verts * 3), faceSeed = new Float32Array(verts);
+  for (let i = 0; i < verts; i += 3) {
+    let cx = 0, cy = 0, cz = 0;
+    for (let k = 0; k < 3; k++) { cx += fp.getX(i + k); cy += fp.getY(i + k); cz += fp.getZ(i + k); }
+    cx /= 3; cy /= 3; cz /= 3;
+    const s = Math.abs(Math.sin(cx * 269.5 + cy * 183.3 + cz * 246.1) * 43758.5453) % 1;
+    for (let k = 0; k < 3; k++) { face[(i + k) * 3] = cx; face[(i + k) * 3 + 1] = cy; face[(i + k) * 3 + 2] = cz; faceSeed[i + k] = s; }
+  }
+  solid.setAttribute("aFace", new THREE.BufferAttribute(face, 3));
+  solid.setAttribute("aSeed", new THREE.BufferAttribute(faceSeed, 1));
+  return { edges, panels: solid };
+}
+
+const SOURCE_GLSL = `
+  #define SOURCES ${SOURCES}
+  uniform vec3 uSource[SOURCES];
+  uniform vec3 uSourceColor[SOURCES];
+  uniform float uSpread; uniform float uIntensity; uniform float uWave; uniform float uTime;
+  uniform vec3 uHoverDir; uniform float uHover; uniform float uHoverArc;
+  vec3 sourceLight(vec3 dir) {
+    vec3 lit = vec3(0.0);
+    for (int i = 0; i < SOURCES; i++) {
+      float ang = acos(clamp(dot(dir, uSource[i]), -1.0, 1.0));
+      float reach = smoothstep(uSpread, 0.0, ang);
+      float ripple = 0.5 + 0.5 * sin(ang * 9.0 - uTime * uWave * 3.0);
+      lit += uSourceColor[i] * reach * (0.55 + ripple * 0.75);
+    }
+    return lit * uIntensity;
+  }
+  float hoverNear(vec3 dir) {
+    float ang = acos(clamp(dot(dir, uHoverDir), -1.0, 1.0));
+    return smoothstep(uHoverArc, 0.0, ang) * uHover;
+  }
+`;
+const SWEEP_GLSL = `
+  uniform float uSweepAxis;
+  float sweepCoord(vec3 worldDir) { return dot(worldDir, vec3(cos(uSweepAxis), sin(uSweepAxis), 0.0)); }
+`;
+const BAND_GLSL = `
+  uniform float uSweepWidth; uniform float uSweepMix;
+  float sweepBand(float coord, float time, float rate) {
+    float head = mix(1.3, -1.3, fract(time * rate * 0.5));
+    float d = coord - head;
+    return exp(-(d * d) / (uSweepWidth * uSweepWidth)) * uSweepMix;
+  }
+`;
+const POINT_VERTEX = `
+  attribute vec3 aDir; attribute float aSeed;
+  uniform float uRadius; uniform float uDotSize; uniform float uWobble; uniform float uFlicker; uniform float uViewHeight;
+  varying float vFacing; varying float vLit; varying vec3 vGlow; varying float vSeed; varying float vNear; varying float vFlick;
+  ${SOURCE_GLSL}
+  void main() {
+    vec3 glow = sourceLight(aDir);
+    vGlow = glow; vLit = min(1.0, max(max(glow.r, glow.g), glow.b));
+    vSeed = aSeed; vNear = hoverNear(aDir);
+    float w = sin(aDir.x * 4.1 + uTime * 1.7) * cos(aDir.y * 3.3 - uTime * 1.3) * sin(aDir.z * 3.9 + uTime * 0.9 + aSeed * 0.6);
+    float rate = 1.4 + aSeed * 4.6;
+    float f = sin(uTime * rate + aSeed * 61.0) * 0.6 + sin(uTime * rate * 1.7 + aSeed * 23.0) * 0.4;
+    vFlick = 1.0 - uFlicker * (1.0 - (0.5 + 0.5 * f));
+    float r = uRadius * (1.0 + w * uWobble + vLit * 0.03 + vNear * 0.02);
+    vec4 mv = modelViewMatrix * vec4(aDir * r, 1.0);
+    vec3 n = normalize((modelViewMatrix * vec4(aDir, 0.0)).xyz);
+    vFacing = dot(n, normalize(-mv.xyz));
+    float size = uDotSize * (1.0 + vLit * 0.5 + vNear * 0.6) * mix(1.0, vFlick, 0.35);
+    gl_PointSize = max(size * (uViewHeight * projectionMatrix[1][1]) / (-2.0 * mv.z), 0.0);
+    gl_Position = projectionMatrix * mv;
+  }
+`;
+const POINT_FRAGMENT = `
+  precision highp float;
+  uniform vec3 uDot;
+  varying float vFacing; varying float vLit; varying vec3 vGlow; varying float vSeed; varying float vNear; varying float vFlick;
+  void main() {
+    float d = length(gl_PointCoord - 0.5) * 2.0;
+    float core = 1.0 - smoothstep(0.0, 0.45, d);
+    float halo = exp(-d * d * 2.5);
+    float depth = mix(0.25, 1.0, smoothstep(-0.6, 0.65, vFacing));
+    float grain = 0.7 + 0.3 * vSeed;
+    vec3 col = uDot * grain + vGlow;
+    float a = (core * 0.8 + halo * 0.35) * depth * vFlick * (0.85 + vLit * 0.9 + vNear * 0.8);
+    if (a < 0.002) discard;
+    gl_FragColor = vec4(col * a, a);
+  }
+`;
+const CAGE_VERTEX = `
+  attribute float aEdge; attribute float aSeed;
+  varying float vFacing; varying float vEdge; varying float vSeed; varying vec3 vGlow; varying float vNear; varying float vSweep;
+  ${SOURCE_GLSL}
+  ${SWEEP_GLSL}
+  void main() {
+    vec3 dir = normalize(position);
+    vEdge = aEdge; vSeed = aSeed; vGlow = sourceLight(dir); vNear = hoverNear(dir);
+    vSweep = sweepCoord(normalize((modelMatrix * vec4(position, 1.0)).xyz));
+    vec4 mv = modelViewMatrix * vec4(position, 1.0);
+    vec3 n = normalize((modelViewMatrix * vec4(dir, 0.0)).xyz);
+    vFacing = dot(n, normalize(-mv.xyz));
+    gl_Position = projectionMatrix * mv;
+  }
+`;
+const CAGE_FRAGMENT = `
+  precision highp float;
+  uniform vec3 uNet; uniform vec3 uShimmerColor; uniform float uNetGlow; uniform float uShimmer; uniform float uHoverGlow; uniform float uEdgeMix; uniform float uTime;
+  varying float vFacing; varying float vEdge; varying float vSeed; varying vec3 vGlow; varying float vNear; varying float vSweep;
+  ${BAND_GLSL}
+  void main() {
+    float depth = mix(0.32, 1.0, smoothstep(-0.9, 0.8, vFacing));
+    float head = fract(vSeed + uTime * uShimmer);
+    float run = smoothstep(0.3, 0.0, abs(vEdge - head)) * uEdgeMix;
+    float sweep = sweepBand(vSweep, uTime, uShimmer);
+    float twinkle = 0.5 + 0.5 * sin(vSeed * 43.0 + uTime * uShimmer * 5.0);
+    float spark = clamp(run * 1.1 + sweep * 1.2 + twinkle * 0.35, 0.0, 1.0);
+    vec3 col = mix(uNet, uShimmerColor, spark) + vGlow * 0.6;
+    float a = uNetGlow * depth * (0.4 + run * 1.5 + sweep * 1.9 + twinkle * 0.3);
+    a += vNear * uHoverGlow * depth;
+    if (a < 0.002) discard;
+    gl_FragColor = vec4(col * a, a);
+  }
+`;
+const PANEL_VERTEX = `
+  attribute vec3 aFace; attribute float aSeed;
+  varying float vFacing; varying float vSeed; varying float vNear; varying vec3 vGlow; varying float vSweep;
+  ${SOURCE_GLSL}
+  ${SWEEP_GLSL}
+  void main() {
+    vec3 dir = normalize(aFace);
+    vSeed = aSeed; vNear = hoverNear(dir); vGlow = sourceLight(dir);
+    vSweep = sweepCoord(normalize((modelMatrix * vec4(aFace, 0.0)).xyz));
+    vec4 mv = modelViewMatrix * vec4(position, 1.0);
+    vec3 n = normalize((modelViewMatrix * vec4(dir, 0.0)).xyz);
+    vFacing = dot(n, normalize(-mv.xyz));
+    gl_Position = projectionMatrix * mv;
+  }
+`;
+const PANEL_FRAGMENT = `
+  precision highp float;
+  uniform vec3 uNet; uniform vec3 uShimmerColor; uniform float uFill; uniform float uShimmer; uniform float uEdgeMix; uniform float uTime;
+  varying float vFacing; varying float vSeed; varying float vNear; varying vec3 vGlow; varying float vSweep;
+  ${BAND_GLSL}
+  void main() {
+    float depth = mix(0.12, 1.0, smoothstep(-0.4, 0.7, vFacing));
+    float pulse = (0.5 + 0.5 * sin(vSeed * 31.0 + uTime * uShimmer * 4.0)) * uEdgeMix;
+    pulse = clamp(pulse + sweepBand(vSweep, uTime, uShimmer) * 1.2, 0.0, 1.0);
+    vec3 col = mix(uNet, uShimmerColor, pulse * 0.7) + vGlow * 0.5;
+    float a = uFill * depth * vNear * (0.45 + pulse * 0.9);
+    if (a < 0.002) discard;
+    gl_FragColor = vec4(col * a, a);
+  }
+`;
+
+class GlobeScene {
+  constructor(container, cfg) {
+    this.container = container; this.cfg = cfg;
+    const S = settingsFor(cfg);
+    this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    this.dpr = Math.min(window.devicePixelRatio || 1, 2);
+    this.renderer.setPixelRatio(this.dpr);
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+    this.renderer.setClearColor(0x000000, 0);
+    const el = this.renderer.domElement;
+    el.style.position = "absolute"; el.style.inset = "0"; el.style.width = "100%"; el.style.height = "100%"; el.style.cursor = "grab"; el.style.touchAction = "none";
+    container.appendChild(el);
+
+    this.scene = new THREE.Scene();
+    this.camera = new THREE.PerspectiveCamera(30, 1, 0.1, 2000);
+    this.group = new THREE.Group();
+
+    const starts = [new THREE.Vector3(-0.6, -0.45, 0.65), new THREE.Vector3(0.72, 0.35, 0.6), new THREE.Vector3(0.1, 0.9, -0.42)];
+    const axes = [new THREE.Vector3(0.2, 1, 0.1), new THREE.Vector3(-0.8, 0.4, 0.3), new THREE.Vector3(0.3, -0.5, 0.9)];
+    this.sources = starts.map(v => v.clone().normalize());
+    this.axes = axes.map(v => v.clone().normalize());
+
+    this.hoverDir = new THREE.Vector3(0, 0, 1);
+    this.aimX = 0; this.aimY = 0; this.grip = 0; this.targetGrip = 0; this.halfHeight = 1.5;
+    this.time = 0; this.spinAngle = 0; this.dragX = 0; this.dragY = 0; this.velX = 0; this.velY = 0;
+    this.isDragging = false; this.lastX = 0; this.lastY = 0;
+    this.width = 0; this.height = 0; this.frameId = 0; this.lastT = 0; this.disposed = false;
+
+    const shared = {
+      uTime: { value: 0 }, uSpread: { value: S.spread }, uIntensity: { value: S.intensity }, uWave: { value: S.wave },
+      uSource: { value: this.sources.map(v => v.clone()) },
+      uSourceColor: { value: this.sourceColors(cfg) },
+      uHoverDir: { value: this.hoverDir }, uHover: { value: 0 }, uHoverArc: { value: S.hoverArc },
+    };
+    const cageColors = {
+      uNet: { value: new THREE.Color(cfg.net) },
+      uShimmerColor: { value: new THREE.Color(cfg.shimmer.color) },
+      uShimmer: { value: S.shimmer }, uEdgeMix: { value: S.edgeMix }, uSweepMix: { value: S.sweepMix },
+      uSweepAxis: { value: S.sweepAxis }, uSweepWidth: { value: S.sweepWidth },
+    };
+
+    this.pointMat = new THREE.ShaderMaterial({
+      vertexShader: POINT_VERTEX, fragmentShader: POINT_FRAGMENT,
+      uniforms: { ...shared, uRadius: { value: S.radius }, uDotSize: { value: S.dotSize }, uWobble: { value: S.wobble }, uFlicker: { value: S.flicker }, uViewHeight: { value: 600 }, uDot: { value: new THREE.Color(cfg.dot) } },
+      transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false,
+    });
+    this.cageMat = new THREE.ShaderMaterial({
+      vertexShader: CAGE_VERTEX, fragmentShader: CAGE_FRAGMENT,
+      uniforms: { ...shared, ...cageColors, uNetGlow: { value: S.netGlow }, uHoverGlow: { value: S.hoverGlow } },
+      transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false,
+    });
+    this.panelMat = new THREE.ShaderMaterial({
+      vertexShader: PANEL_VERTEX, fragmentShader: PANEL_FRAGMENT,
+      uniforms: { ...shared, ...cageColors, uFill: { value: S.hoverFill } },
+      transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false, side: THREE.DoubleSide,
+    });
+
+    this.pointGeo = buildPoints(S.points);
+    this.points = new THREE.Points(this.pointGeo, this.pointMat);
+    this.points.frustumCulled = false;
+    this.group.add(this.points);
+
+    const built = buildCage(S.radius * S.cage, S.detail);
+    this.cageGeo = built.edges; this.panelGeo = built.panels;
+    this.cage = new THREE.LineSegments(this.cageGeo, this.cageMat);
+    this.panels = new THREE.Mesh(this.panelGeo, this.panelMat);
+    this.cage.frustumCulled = false; this.panels.frustumCulled = false;
+    this.group.add(this.panels); this.group.add(this.cage);
+    this.scene.add(this.group);
+    this.unbind = () => {};
+    this.bindEvents();
+  }
+  sourceColors(cfg) {
+    const wv = cfg.waves;
+    const a = new THREE.Color(wv.color), b = new THREE.Color(wv.color2);
+    return [a.clone(), b.clone(), a.clone().lerp(b, 0.35)];
+  }
+  bindEvents() {
+    const el = this.renderer.domElement;
+    const down = e => { this.isDragging = true; this.lastX = e.clientX; this.lastY = e.clientY; this.velX = 0; this.velY = 0; el.style.cursor = "grabbing"; };
+    const move = e => {
+      const r = this.container.getBoundingClientRect();
+      if (r.width && r.height) { this.aimX = ((e.clientX - r.left) / r.width) * 2 - 1; this.aimY = -(((e.clientY - r.top) / r.height) * 2 - 1); }
+      if (!this.isDragging) return;
+      const dx = e.clientX - this.lastX, dy = e.clientY - this.lastY;
+      this.lastX = e.clientX; this.lastY = e.clientY;
+      this.dragY += dx * DRAG; this.dragX += dy * DRAG; this.velY = dx * DRAG; this.velX = dy * DRAG;
+    };
+    const up = () => { this.isDragging = false; el.style.cursor = "grab"; };
+    const enter = () => { this.targetGrip = 1; };
+    const leave = () => { this.targetGrip = 0; up(); };
+    el.addEventListener("pointerdown", down);
+    el.addEventListener("pointerenter", enter);
+    el.addEventListener("pointerleave", leave);
+    el.addEventListener("pointercancel", leave);
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    this.unbind = () => {
+      el.removeEventListener("pointerdown", down); el.removeEventListener("pointerenter", enter);
+      el.removeEventListener("pointerleave", leave); el.removeEventListener("pointercancel", leave);
+      window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up);
+    };
+  }
+  start() { this.lastT = performance.now(); const loop = () => { this.frameId = requestAnimationFrame(loop); this.step(); }; loop(); }
+  setSize(w, h) {
+    if (this.disposed || w <= 0 || h <= 0) return;
+    this.width = w; this.height = h;
+    this.renderer.setSize(w, h, false);
+    this.pointMat.uniforms.uViewHeight.value = h * this.dpr;
+    this.updateCamera();
+  }
+  updateCamera() {
+    const aspect = Math.max(1, this.width) / Math.max(1, this.height);
+    const distance = 1 / PERSPECTIVE;
+    const sizePct = clamp(this.cfg.sizePercent, 20, 200, 53);
+    const S = settingsFor(this.cfg);
+    const span = S.radius * S.cage * 2.55 * (100 / sizePct);
+    const visibleHeight = aspect < 1 ? span / aspect : span;
+    this.halfHeight = visibleHeight / 2;
+    this.camera.aspect = aspect;
+    this.camera.position.set(0, 0, distance);
+    this.camera.lookAt(0, 0, 0);
+    this.camera.fov = 2 * Math.atan(visibleHeight / 2 / distance) * (180 / Math.PI);
+    this.camera.near = Math.max(0.1, distance - 20);
+    this.camera.far = distance + 20;
+    this.camera.updateProjectionMatrix();
+  }
+  updateHoverDir() {
+    const aspect = Math.max(1, this.width) / Math.max(1, this.height);
+    const distance = 1 / PERSPECTIVE, halfH = this.halfHeight, halfW = halfH * aspect;
+    const oz = distance;
+    let dx = this.aimX * halfW, dy = this.aimY * halfH, dz = -oz;
+    const len = Math.hypot(dx, dy, dz) || 1;
+    dx /= len; dy /= len; dz /= len;
+    const S = settingsFor(this.cfg);
+    const radius = S.radius * S.cage;
+    const b = oz * dz, c = oz * oz - radius * radius, disc = b * b - c;
+    const t = disc > 0 ? -b - Math.sqrt(disc) : -b;
+    const hit = new THREE.Vector3(dx * t, dy * t, oz + dz * t);
+    this.group.updateMatrixWorld();
+    this.group.worldToLocal(hit);
+    if (hit.lengthSq() > 1e-8) this.hoverDir.copy(hit.normalize());
+  }
+  step() {
+    if (this.disposed) return;
+    const now = performance.now();
+    let dt = (now - this.lastT) / 1000; this.lastT = now;
+    if (!isFinite(dt) || dt < 0) dt = 0;
+    if (dt > 0.05) dt = 0.05;
+    const S = settingsFor(this.cfg);
+    this.time += dt;
+    const live = this.pointMat.uniforms.uSource.value;
+    for (let i = 0; i < SOURCES; i++) {
+      this.sources[i].applyAxisAngle(this.axes[i], dt * S.wave * (0.35 + i * 0.12)).normalize();
+      live[i].copy(this.sources[i]);
+    }
+    if (!this.isDragging) {
+      const decay = Math.exp(-dt * 3);
+      this.dragY += this.velY; this.dragX += this.velX;
+      this.velX *= decay; this.velY *= decay;
+      this.spinAngle += S.spin * dt;
+    }
+    this.pointMat.uniforms.uTime.value = this.time;
+    this.cageMat.uniforms.uTime.value = this.time;
+    this.panelMat.uniforms.uTime.value = this.time;
+    this.group.rotation.y = this.spinAngle + this.dragY;
+    this.group.rotation.x = clamp(this.dragX * 0.5, -1, 1, 0);
+    this.grip += (this.targetGrip * S.hoverOn - this.grip) * (1 - Math.exp(-dt * 5));
+    this.pointMat.uniforms.uHover.value = this.grip;
+    if (this.grip > 0.001) this.updateHoverDir();
+    this.renderer.render(this.scene, this.camera);
+  }
+  dispose() {
+    this.disposed = true;
+    cancelAnimationFrame(this.frameId);
+    this.unbind();
+    this.pointGeo.dispose(); this.cageGeo.dispose(); this.panelGeo.dispose();
+    this.pointMat.dispose(); this.cageMat.dispose(); this.panelMat.dispose();
+    this.renderer.dispose();
+    const el = this.renderer.domElement;
+    if (el.parentNode === this.container) this.container.removeChild(el);
+  }
+}
+
+/* ---- boot both effects on load ---- */
+function boot() {
+  runParticleText({
+    canvas: document.getElementById("textCanvas"),
+    text: "GSO / GCTS Tools",
+    colors: ["#F9731A"],
+    particleSize: 10,
+    particleCount: 46,
+    fontSize: 60,
+    mouseForce: 9,
+    durationMs: 1300,
+    ease: [0.44, 0, 0.56, 1],
+  });
+  document.getElementById("tagline").classList.add("show");
+
+  const globeWrap = document.getElementById("globeWrap");
+  const scene = new GlobeScene(globeWrap, GDEFAULTS);
+  scene.setSize(globeWrap.clientWidth, globeWrap.clientHeight);
+  scene.start();
+  new ResizeObserver(() => scene.setSize(globeWrap.clientWidth, globeWrap.clientHeight)).observe(globeWrap);
+}
+if (document.readyState === "complete") boot();
+else window.addEventListener("load", boot);
+</script>
+</body>
+</html>

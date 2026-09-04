@@ -31,15 +31,27 @@ from docx.oxml import OxmlElement
 # exclude. Add more codes here if the workbook uses other highlight colors.
 EXCLUDED_FILL_COLORS = {"FFFFFF00", "FF00B050"}  # yellow, green
 
-# Columns are found by matching the sheet's HEADER_ROW text against these
-# accepted labels (case-insensitive, whitespace-normalized) -- not by a
-# fixed position. So it keeps working even if columns get reordered or a
-# new column gets inserted. Add more variants here if a workbook uses
-# different wording for one of these.
-GCTS_HEADERS = {"gcts", "gcts no", "gcts no.", "gcts number"}
-PRODUCT_HEADERS = {"product name", "product"}
-BRAND_HEADERS = {"brand"}
-MODEL_HEADERS = {"model no.", "model no", "model number", "model"}
+# Columns are found in two passes against the sheet's HEADER_ROW text
+# (case-insensitive, whitespace-normalized), not by fixed position:
+#   1. Exact match against a field's *_EXACT set first -- this is what
+#      resolves sheets with several similarly-named columns correctly
+#      (e.g. both "GCTS No" and "Product GCTS" contain "gcts", but only
+#      "GCTS No" is an exact match, so it wins outright; likewise
+#      "Product Description" beats "Product GCTS"/"Product Category" for
+#      the product field).
+#   2. Only for any field still unresolved, a loose substring match
+#      against *_KEYWORDS, for sheets that don't use any of the exact
+#      phrasings below.
+# Add more entries to either list if a workbook still isn't recognized.
+GCTS_EXACT = {"gcts", "gcts no", "gcts no.", "gcts number", "gcts certificate no"}
+PRODUCT_EXACT = {"product name", "product description", "product"}
+BRAND_EXACT = {"brand", "brand name", "trademark", "trademark/brand"}
+MODEL_EXACT = {"model no.", "model no", "model number", "model"}
+
+GCTS_KEYWORDS = ["gcts"]
+PRODUCT_KEYWORDS = ["product"]
+BRAND_KEYWORDS = ["brand"]
+MODEL_KEYWORDS = ["model"]
 
 SHEET_NAME = "All 35 GCTS Lookup"
 HEADER_ROW = 1
@@ -68,31 +80,49 @@ def _normalize_header(value):
 
 def find_columns(ws, header_row=HEADER_ROW):
     """Scan the header row and return {'gcts': col, 'product': col,
-    'brand': col, 'model': col} by matching each field's accepted header
-    text against the sheet's actual headers -- not by fixed position."""
-    wanted = {
-        "gcts": GCTS_HEADERS, "product": PRODUCT_HEADERS,
-        "brand": BRAND_HEADERS, "model": MODEL_HEADERS,
+    'brand': col, 'model': col}. Exact-phrase matches are resolved first
+    (so sheets with several similarly-worded columns pick the right one),
+    then any field still unresolved falls back to a loose substring match.
+    Not by fixed position."""
+    exact = {
+        "gcts": GCTS_EXACT, "product": PRODUCT_EXACT,
+        "brand": BRAND_EXACT, "model": MODEL_EXACT,
+    }
+    keywords = {
+        "gcts": GCTS_KEYWORDS, "product": PRODUCT_KEYWORDS,
+        "brand": BRAND_KEYWORDS, "model": MODEL_KEYWORDS,
     }
     found = {}
     all_headers = []
+    normalized = []
     for col in range(1, ws.max_column + 1):
         raw = ws.cell(row=header_row, column=col).value
         all_headers.append(raw)
-        text = _normalize_header(raw)
+        normalized.append(_normalize_header(raw))
+
+    # Pass 1: exact match, in column order, first hit per field wins.
+    for col, text in enumerate(normalized, start=1):
         if not text:
             continue
-        for field, variants in wanted.items():
-            if field not in found and text in variants:
+        for field, phrases in exact.items():
+            if field not in found and text in phrases:
                 found[field] = col
 
-    missing = [f for f in wanted if f not in found]
+    # Pass 2: loose substring match, only for fields exact-matching missed.
+    for col, text in enumerate(normalized, start=1):
+        if not text:
+            continue
+        for field, kws in keywords.items():
+            if field not in found and any(kw in text for kw in kws):
+                found[field] = col
+
+    missing = [f for f in exact if f not in found]
     if missing:
         raise KeyError(
             f"Could not find a column for: {', '.join(missing)} in row {header_row} "
             f"of sheet '{ws.title}'. Headers found: {all_headers}. "
             f"If this sheet spells a header differently, add it to the matching "
-            f"*_HEADERS set near the top of this file."
+            f"*_EXACT set or *_KEYWORDS list near the top of this file."
         )
     return found
 

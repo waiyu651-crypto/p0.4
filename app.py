@@ -45,8 +45,16 @@ st.markdown(
 )
 
 # Hero banner: particle-text title + spinning globe, both animate in on load.
-_hero_html = (Path(__file__).parent / "assets" / "hero.html").read_text()
-components.html(_hero_html, height=320, scrolling=False)
+_hero_path = Path(__file__).parent / "assets" / "hero.html"
+if _hero_path.exists():
+    components.html(_hero_path.read_text(encoding="utf-8"), height=320, scrolling=False)
+else:
+    st.warning(
+        f"Hero banner not found at {_hero_path} — the assets/hero.html file "
+        "is missing from this deployment. Check that the 'assets' folder was "
+        "actually committed to the repo (not left inside a zip), then redeploy."
+    )
+    st.title("🧰 GSO / GCTS Tools")
 
 # --------------------------------------------------------------------- #
 # One-time setup: make sure the Playwright chromium browser is installed.
@@ -100,7 +108,12 @@ if tool.startswith("1"):
             tmp_in = WORKDIR / "t1_input.xlsx"
             tmp_in.write_bytes(xlsx_file.getvalue())
 
-            rows = gr.load_rows(str(tmp_in))
+            try:
+                rows = gr.load_rows(str(tmp_in))
+            except Exception as e:
+                st.error(f"Couldn't read the workbook: {e}")
+                st.stop()
+
             if not rows:
                 st.error("No non-highlighted rows found — check the sheet name / highlight colors.")
             else:
@@ -338,7 +351,12 @@ else:
             tmp_in = WORKDIR / "t4_input.xlsx"
             tmp_in.write_bytes(xlsx_file.getvalue())
 
-            rows = gel.load_rows(str(tmp_in))
+            try:
+                rows = gel.load_rows(str(tmp_in))
+            except Exception as e:
+                st.error(f"Couldn't read the workbook: {e}")
+                st.stop()
+
             if not rows:
                 st.error("No non-highlighted rows found — check the sheet name / highlight colors.")
                 st.stop()
